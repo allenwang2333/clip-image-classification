@@ -7,32 +7,38 @@ from torchvision.transforms import ToPILImage
 
 
 class CLIPImageClassification(nn.Module):
-    def __init__(self, num_classes=101):
+    def __init__(self, num_classes=101, batch_size=32):
         super(CLIPImageClassification, self).__init__()
         
         self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
         self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
-        self.fc = nn.Sequential(
-            nn.Linear(num_classes, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_classes)
+        self.fc_for_text = nn.Sequential(
+            nn.Linear(512, 1024), # make hidden dimention 1024
+            nn.GELU(),
+        )
+        self.fc_for_image = nn.Sequential( 
+            nn.Linear(512, 1024),
+            nn.GELU(),
         )
        
         for param in self.model.parameters():
             param.requires_grad = False
 
     def forward(self, images, texts):
-        images = [ToPILImage()(image) for image in images]
         inputs = self.processor(texts, images, return_tensors="pt", padding=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        outputs = self.model(**inputs).logits_per_image
-        outputs = self.fc(outputs)
+        outputs = self.model(**inputs)
+        text_emb = self.fc_for_text(outputs.text_embeds) 
+        image_emb = self.fc_for_image(outputs.image_embeds)
+        image_text_similarity = (image_emb @ text_emb.T) 
+        text_image_similarity = image_text_similarity.T
+        ground_truth = torch.arange(0, image_emb.shape[0], dtype=torch.long, device=self.device)
+        return image_text_similarity, text_image_similarity, ground_truth
 
     def to(self, device):
         self.device = device
-        self.fc.to(self.device)
+        self.fc_for_image.to(self.device)
+        self.fc_for_text.to(self.device)
         self.model.to(self.device)
         return self
     
@@ -44,7 +50,10 @@ class CLIPWrapper(L.LightningModule):
     def training_step(self, batch, batch_idx):
         images, texts, labels = batch
         outputs = self.model(images, texts)
-        loss = F.cross_entropy(outputs, labels)
+        images_text_similarity, text_images_similarity, ground_truth = outputs
+        image_loss = F.cross_entropy(images_text_similarity, ground_truth)
+        text_loss = F.cross_entropy(text_images_similarity, ground_truth)
+        loss = (image_loss + text_loss) / 2
         self.log("train_loss", loss)
         return loss
     
